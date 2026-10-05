@@ -12,7 +12,7 @@ import {
   voiceCatalogEntry,
 } from "@rakazo/adapters";
 import type { Actor, VoiceCredential, VoiceStatus } from "@rakazo/contracts";
-import { toUtterances } from "@rakazo/core";
+import { stripAudioEventTags, toUtterances } from "@rakazo/core";
 import {
   deleteUnreferencedCredentialSecret,
   findDefaultVoiceCredential,
@@ -382,7 +382,7 @@ export async function transcribeVoice(
   if (input.audio.byteLength === 0 || input.audio.byteLength > MAX_TRANSCRIBE_BYTES) {
     throw new ORPCError("BAD_REQUEST", { message: "That recording is empty or too large." });
   }
-  return provider.transcribe(
+  const result = await provider.transcribe(
     {
       audio: input.audio,
       mimeType: input.mimeType || "audio/webm",
@@ -391,6 +391,7 @@ export async function transcribeVoice(
     },
     voiceContext(actor, input.signal),
   );
+  return { text: stripAudioEventTags(result.text) };
 }
 
 export function mountVoiceHttpRoutes(

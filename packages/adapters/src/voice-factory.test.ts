@@ -98,11 +98,11 @@ describe("ElevenLabsVoiceProvider", () => {
     expect(String(fetchMock.mock.calls[0]?.[0])).toContain("/text-to-speech/abc");
   });
 
-  it("transcribes through Scribe", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue(new Response(JSON.stringify({ text: "hello there" }))),
-    );
+  it("transcribes through Scribe without sound labels", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(new Response(JSON.stringify({ text: "hello there" })));
+    vi.stubGlobal("fetch", fetchMock);
     const provider = new ElevenLabsVoiceProvider();
     await expect(
       provider.transcribe!(
@@ -110,6 +110,8 @@ describe("ElevenLabsVoiceProvider", () => {
         ctx,
       ),
     ).resolves.toEqual({ text: "hello there" });
+    const form = fetchMock.mock.calls[0]?.[1]?.body as FormData;
+    expect(form.get("tag_audio_events")).toBe("false");
   });
 });
 

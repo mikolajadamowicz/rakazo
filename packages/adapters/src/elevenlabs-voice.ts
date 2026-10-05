@@ -88,6 +88,8 @@ export class ElevenLabsVoiceProvider implements VoiceProvider {
   ): Promise<{ text: string }> {
     const form = new FormData();
     form.set("model_id", TRANSCRIBE_MODEL);
+    // Scribe labels background sounds by default; a call would send them as the caller's words.
+    form.set("tag_audio_events", "false");
     form.set(
       "file",
       new Blob([new Uint8Array(request.audio)], { type: request.mimeType || "audio/webm" }),
