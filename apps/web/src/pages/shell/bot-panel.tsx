@@ -11,6 +11,7 @@ import type {
 } from "@rakazo/contracts";
 import {
   BOT_DESCRIPTION_MAX_LENGTH,
+  BOT_INSTRUCTIONS_MAX_LENGTH,
   BOT_NAME_MAX_LENGTH,
   BOT_TITLE_MAX_LENGTH,
 } from "@rakazo/contracts";
@@ -231,11 +232,15 @@ export function BotSettings({
   const [name, setName] = useState(bot.name);
   const [title, setTitle] = useState(bot.title);
   const [description, setDescription] = useState(bot.description);
+  const [instructions, setInstructions] = useState(bot.instructions);
   // A roster refresh can skip replacing bots while a reorder is in flight, so
-  // this prop keeps the description from when the panel opened. Later saves
-  // compare against the description last saved here; otherwise a model or
-  // voice change treats that stale text as an edit and overwrites instructions.
-  const savedDescriptionRef = useRef(bot.description ?? "");
+  // this prop keeps the text from when the panel opened. Later saves compare
+  // against the text last saved here; otherwise a model or voice change treats
+  // that stale text as an edit and overwrites it.
+  const savedProfileRef = useRef({
+    description: bot.description ?? "",
+    instructions: bot.instructions ?? "",
+  });
   const [color, setColor] = useState(bot.color);
   const [notifyOnFinish, setNotifyOnFinish] = useState(bot.notifyOnFinish ?? true);
   const [computerMode, setComputerMode] = useState(bot.computerMode);
@@ -259,6 +264,7 @@ export function BotSettings({
       name?: string;
       title?: string;
       description?: string;
+      instructions?: string;
       color?: string;
       notifyOnFinish?: boolean;
     }) => Promise<void>
@@ -316,6 +322,7 @@ export function BotSettings({
     name?: string;
     title?: string;
     description?: string;
+    instructions?: string;
     color?: string;
     notifyOnFinish?: boolean;
   }) {
@@ -325,6 +332,9 @@ export function BotSettings({
     const nextDescription = (
       patchOverrides?.description !== undefined ? patchOverrides.description : description
     ).trim();
+    const nextInstructions = (
+      patchOverrides?.instructions !== undefined ? patchOverrides.instructions : instructions
+    ).trim();
     const nextColor = patchOverrides?.color !== undefined ? patchOverrides.color : color;
     const nextNotify =
       patchOverrides?.notifyOnFinish !== undefined ? patchOverrides.notifyOnFinish : notifyOnFinish;
@@ -332,6 +342,7 @@ export function BotSettings({
     if (nextName) setName(nextName);
     setTitle(nextTitle);
     setDescription(nextDescription);
+    setInstructions(nextInstructions);
 
     try {
       setSaving(true);
@@ -339,10 +350,12 @@ export function BotSettings({
       await onSave({
         name: nextName || bot.name,
         title: nextTitle,
-        // One field feeds both, so it only goes on the wire when it changed: a
-        // model, thinking or voice save must not overwrite longer instructions,
-        // nor fail on a description that is already above its own limit.
-        ...botProfilePatch(savedDescriptionRef.current, nextDescription),
+        // Text only goes on the wire when it changed: a model, thinking or voice
+        // save must not overwrite it, nor fail on text already above its limit.
+        ...botProfilePatch(savedProfileRef.current, {
+          description: nextDescription,
+          instructions: nextInstructions,
+        }),
         // Unchanged color stays off the wire so a legacy named value cannot fail a name save.
         ...(nextColor !== bot.color ? { color: nextColor } : {}),
         notifyOnFinish: nextNotify,
@@ -360,7 +373,7 @@ export function BotSettings({
             }
           : {}),
       });
-      savedDescriptionRef.current = nextDescription;
+      savedProfileRef.current = { description: nextDescription, instructions: nextInstructions };
     } catch (err) {
       setError(errorText(err, t`Could not save`));
     } finally {
@@ -373,6 +386,7 @@ export function BotSettings({
     name?: string;
     title?: string;
     description?: string;
+    instructions?: string;
     color?: string;
     notifyOnFinish?: boolean;
   }) {
@@ -428,7 +442,11 @@ export function BotSettings({
           id={`${ids}-description`}
           value={description}
           maxLength={BOT_DESCRIPTION_MAX_LENGTH}
-          onChange={(e) => setDescription(e.target.value)}
+          onChange={(e) => {
+            // Instructions follow the description until someone edits them.
+            if (instructions === description) setInstructions(e.target.value);
+            setDescription(e.target.value);
+          }}
           onBlur={() => void enqueueSave()}
           rows={3}
           className="mt-1.5"
@@ -472,6 +490,18 @@ export function BotSettings({
             ›
           </span>
         </summary>
+        <label htmlFor={`${ids}-instructions`} className={fieldLabelClass}>
+          <Trans>Instructions</Trans>
+          <Textarea
+            id={`${ids}-instructions`}
+            value={instructions}
+            maxLength={BOT_INSTRUCTIONS_MAX_LENGTH}
+            onChange={(e) => setInstructions(e.target.value)}
+            onBlur={() => void enqueueSave()}
+            rows={8}
+            className="mt-1.5"
+          />
+        </label>
         <ComputerModePicker value={computerMode} onChange={setComputerMode} />
         <ErrorBoundary fallback={<SectionLoadFailed />}>
           <Suspense fallback={null}>
@@ -602,6 +632,7 @@ export function BotSettings({
               name,
               title,
               description,
+              instructions,
               color,
               notifyOnFinish,
             });

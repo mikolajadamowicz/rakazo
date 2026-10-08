@@ -80,7 +80,7 @@ msgid "{0} rollup hours"
 msgstr ""
 
 #. placeholder {0}: usage.runs
-#. placeholder {1}: usage.inputTokens + usage.outputTokens
+#. placeholder {1}: usage.totalTokens ?? "—"
 #: src/pages/AccountSettingsOverlay.tsx
 msgid "{0} runs · {1} tokens"
 msgstr "{0}회 실행 · 토큰 {1}개"
@@ -2310,6 +2310,10 @@ msgstr "인스턴스 API 키"
 #: src/pages/RoutineEditor.tsx
 msgid "Instruction"
 msgstr "실행할 내용"
+
+#: src/pages/shell/bot-panel.tsx
+msgid "Instructions"
+msgstr "지침"
 
 #: src/pages/PluginsOverlay.tsx
 msgid "Integration domain"

@@ -236,6 +236,7 @@ export const DE_MESSAGES: Record<string, string> = {
   Model: "Modell",
   Name: "Name",
   "Name this bot": "Bot benennen",
+  Instructions: "Anweisungen",
   "Read replies aloud": "Antworten vorlesen",
   Save: "Speichern",
   "Saving…": "Wird gespeichert…",

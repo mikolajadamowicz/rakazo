@@ -1,6 +1,7 @@
 import {
   BOT_COLORS,
   BOT_DESCRIPTION_MAX_LENGTH,
+  BOT_INSTRUCTIONS_MAX_LENGTH,
   BOT_NAME_MAX_LENGTH,
   BOT_TITLE_MAX_LENGTH,
   type ComputerMode,
@@ -38,6 +39,7 @@ import { errorText } from "../lib/user-error";
 
 type BotSettingsRecord = MobileBot & {
   description?: string;
+  instructions?: string;
 };
 
 export default function BotSettingsScreen() {
@@ -49,6 +51,7 @@ export default function BotSettingsScreen() {
   const [name, setName] = useState("");
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
+  const [instructions, setInstructions] = useState("");
   const [color, setColor] = useState<string>(BOT_COLORS[0]);
   const [computerMode, setComputerMode] = useState<ComputerMode>("team");
   const [advancedOpen, setAdvancedOpen] = useState(false);
@@ -71,6 +74,7 @@ export default function BotSettingsScreen() {
         setName(next.name);
         setTitle(next.title);
         setDescription(next.description ?? "");
+        setInstructions(next.instructions ?? "");
         setColor(next.color);
         setComputerMode(next.computerMode);
         setModelKey(
@@ -195,8 +199,10 @@ export default function BotSettingsScreen() {
       if (profile.title !== bot.title) input.title = profile.title;
       if (profile.description !== (bot.description ?? "")) {
         input.description = profile.description;
-        // Keep instructions in sync with description (same as web BotSettings).
-        input.instructions = profile.instructions;
+      }
+      const nextInstructions = instructions.trim().slice(0, BOT_INSTRUCTIONS_MAX_LENGTH);
+      if (nextInstructions !== (bot.instructions ?? "").trim()) {
+        input.instructions = nextInstructions;
       }
       if (color !== bot.color) input.color = color;
       const modelChanged =
@@ -285,7 +291,11 @@ export default function BotSettingsScreen() {
         <TextInput
           value={description}
           maxLength={BOT_DESCRIPTION_MAX_LENGTH}
-          onChangeText={setDescription}
+          onChangeText={(value) => {
+            // Instructions follow the description until someone edits them.
+            if (instructions === description) setInstructions(value);
+            setDescription(value);
+          }}
           placeholder={t("What this bot is for")}
           placeholderTextColor={tokens.mutedForeground}
           multiline
@@ -364,6 +374,26 @@ export default function BotSettingsScreen() {
         </Pressable>
         {advancedOpen ? (
           <View>
+            <Text style={{ color: tokens.mutedForeground, marginTop: 8, fontSize: 14 }}>
+              {t("Instructions")}
+            </Text>
+            <TextInput
+              accessibilityLabel={t("Instructions")}
+              value={instructions}
+              maxLength={BOT_INSTRUCTIONS_MAX_LENGTH}
+              onChangeText={setInstructions}
+              multiline
+              style={{
+                marginTop: 8,
+                marginBottom: 16,
+                backgroundColor: native.fill,
+                borderRadius: 11,
+                padding: 16,
+                color: tokens.foreground,
+                minHeight: 200,
+                textAlignVertical: "top",
+              }}
+            />
             <View
               style={{
                 marginTop: 8,

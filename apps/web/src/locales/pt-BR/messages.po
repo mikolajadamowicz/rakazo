@@ -80,7 +80,7 @@ msgid "{0} rollup hours"
 msgstr ""
 
 #. placeholder {0}: usage.runs
-#. placeholder {1}: usage.inputTokens + usage.outputTokens
+#. placeholder {1}: usage.totalTokens ?? "—"
 #: src/pages/AccountSettingsOverlay.tsx
 msgid "{0} runs · {1} tokens"
 msgstr "{0} execuções · {1} tokens"
@@ -2310,6 +2310,10 @@ msgstr "Chave de API da instância"
 #: src/pages/RoutineEditor.tsx
 msgid "Instruction"
 msgstr "Instrução"
+
+#: src/pages/shell/bot-panel.tsx
+msgid "Instructions"
+msgstr "Instruções"
 
 #: src/pages/PluginsOverlay.tsx
 msgid "Integration domain"

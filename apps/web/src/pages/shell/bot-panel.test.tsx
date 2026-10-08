@@ -69,14 +69,14 @@ import { BotSettings } from "./bot-panel";
 
 const longInstructions = "I".repeat(4_000);
 
-function bot(description = "Billing"): Bot {
+function bot(description = "Billing", instructions = longInstructions): Bot {
   return {
     id: "bot-1",
     spaceId: "space-1",
     name: "Ada",
     title: "Helper",
     description,
-    instructions: longInstructions,
+    instructions,
     color: "ink",
     notifyOnFinish: true,
     pinned: false,
@@ -109,11 +109,11 @@ const onSave = vi.fn(
   async (_patch: Parameters<ComponentProps<typeof BotSettings>["onSave"]>[0]) => undefined,
 );
 
-async function render(description = "Billing") {
+async function render(description = "Billing", instructions = longInstructions) {
   await act(async () => {
     root.render(
       <BotSettings
-        bot={bot(description)}
+        bot={bot(description, instructions)}
         memoryProviderConfigured={false}
         onSkillsChange={() => undefined}
         onSave={onSave}
@@ -124,11 +124,17 @@ async function render(description = "Billing") {
   });
 }
 
-function descriptionField(): HTMLTextAreaElement {
-  const textarea = container.querySelector("textarea");
-  if (!textarea) throw new Error("Missing description field");
+function textField(label: string): HTMLTextAreaElement {
+  const found = [...container.querySelectorAll("label")].find((element) =>
+    element.textContent?.startsWith(label),
+  );
+  const textarea = found?.querySelector("textarea");
+  if (!textarea) throw new Error(`Missing ${label} field`);
   return textarea;
 }
+
+const descriptionField = () => textField("Description");
+const instructionsField = () => textField("Instructions");
 
 function saveButton(): HTMLButtonElement {
   const found = [...container.querySelectorAll("button")].find(
@@ -138,8 +144,7 @@ function saveButton(): HTMLButtonElement {
   return found;
 }
 
-async function setDescription(value: string) {
-  const textarea = descriptionField();
+async function setField(textarea: HTMLTextAreaElement, value: string) {
   await act(async () => {
     Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set?.call(
       textarea,
@@ -218,21 +223,47 @@ describe("BotSettings model choices", () => {
 });
 
 describe("BotSettings description saves", () => {
-  it("leaves instructions off a save that does not edit the description", async () => {
+  it("leaves both fields off a save that does not edit them", async () => {
     await render();
     await clickSave();
     expect(onSave.mock.calls[0]?.[0]).not.toHaveProperty("description");
     expect(onSave.mock.calls[0]?.[0]).not.toHaveProperty("instructions");
   });
 
-  it("does not resend instructions when the bot prop stays on the old description", async () => {
+  it("keeps custom instructions when the description is edited", async () => {
     await render();
-    await setDescription("Invoices");
+    await setField(descriptionField(), "Invoices");
+    await clickSave();
+    expect(onSave.mock.calls[0]?.[0]).toMatchObject({ description: "Invoices" });
+    expect(onSave.mock.calls[0]?.[0]).not.toHaveProperty("instructions");
+  });
+
+  it("carries instructions along while they still match the description", async () => {
+    await render("Billing", "Billing");
+    await setField(descriptionField(), "Invoices");
+    expect(instructionsField().value).toBe("Invoices");
     await clickSave();
     expect(onSave.mock.calls[0]?.[0]).toMatchObject({
       description: "Invoices",
       instructions: "Invoices",
     });
+  });
+
+  it("saves edited instructions on their own", async () => {
+    await render();
+    expect(instructionsField().value).toBe(longInstructions);
+    await setField(instructionsField(), "Answer billing questions");
+    await clickSave();
+    expect(onSave.mock.calls[0]?.[0]).toMatchObject({
+      instructions: "Answer billing questions",
+    });
+    expect(onSave.mock.calls[0]?.[0]).not.toHaveProperty("description");
+  });
+
+  it("does not resend the description when the bot prop stays on the old one", async () => {
+    await render();
+    await setField(descriptionField(), "Invoices");
+    await clickSave();
 
     // The parent still passes the description from when the panel opened.
     await render();
@@ -244,26 +275,20 @@ describe("BotSettings description saves", () => {
 
   it("still saves a description edited back to the stale prop value", async () => {
     await render();
-    await setDescription("Invoices");
+    await setField(descriptionField(), "Invoices");
     await clickSave();
     await render();
-    await setDescription("Billing");
+    await setField(descriptionField(), "Billing");
     await clickSave();
-    expect(onSave.mock.calls[1]?.[0]).toMatchObject({
-      description: "Billing",
-      instructions: "Billing",
-    });
+    expect(onSave.mock.calls[1]?.[0]).toMatchObject({ description: "Billing" });
   });
 
-  it("keeps the previous description as the baseline when a save fails", async () => {
+  it("keeps the previous text as the baseline when a save fails", async () => {
     onSave.mockRejectedValueOnce(new Error("offline"));
     await render();
-    await setDescription("Invoices");
+    await setField(descriptionField(), "Invoices");
     await clickSave();
     await clickSave();
-    expect(onSave.mock.calls[1]?.[0]).toMatchObject({
-      description: "Invoices",
-      instructions: "Invoices",
-    });
+    expect(onSave.mock.calls[1]?.[0]).toMatchObject({ description: "Invoices" });
   });
 });
