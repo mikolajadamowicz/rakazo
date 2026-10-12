@@ -21,20 +21,28 @@ export async function requireMembership(
   userId: string,
   requestedSpaceId?: string | null,
 ): Promise<Actor> {
-  const membership = await prisma.spaceMember.findFirst({
-    where: {
-      userId,
-      ...(requestedSpaceId ? { spaceId: requestedSpaceId } : {}),
-    },
-    orderBy: [{ space: { isDefault: "desc" } }, { createdAt: "asc" }, { id: "asc" }],
-    include: { member: { include: { user: true } } },
-  });
+  // Independent reads: every authenticated request waits on both, so don't chain them.
+  const [membership, settings] = await Promise.all([
+    prisma.spaceMember.findFirst({
+      where: {
+        userId,
+        ...(requestedSpaceId ? { spaceId: requestedSpaceId } : {}),
+      },
+      orderBy: [{ space: { isDefault: "desc" } }, { createdAt: "asc" }, { id: "asc" }],
+      select: {
+        userId: true,
+        spaceId: true,
+        member: { select: { user: { select: { email: true } } } },
+      },
+    }),
+    prisma.deploymentSettings.findUnique({
+      where: { id: "default" },
+      select: { ownerUserId: true },
+    }),
+  ]);
   if (!membership) {
     throw new IsolationError("No personal space");
   }
-  const settings = await prisma.deploymentSettings.findUnique({
-    where: { id: "default" },
-  });
   return {
     userId: membership.userId,
     spaceId: membership.spaceId,

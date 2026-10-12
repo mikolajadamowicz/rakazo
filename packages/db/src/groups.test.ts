@@ -13,10 +13,7 @@ describe("listSpaceGroupsForSpaces", () => {
         pinned: true,
         sectionId: null,
         updatedAt: new Date("2026-08-20T00:00:00.000Z"),
-        thread: {
-          unread: true,
-          messages: [{ blocks: [{ kind: "text", text: "Escalation pending" }] }],
-        },
+        thread: { id: "thread-1", unread: true },
         members: [
           { bot: { id: "bot-1", name: "Triage", color: "#111", runs: [] } },
           {
@@ -30,7 +27,14 @@ describe("listSpaceGroupsForSpaces", () => {
         ],
       },
     ]);
-    const repos = createGroupRepos({ chatGroup: { findMany } } as unknown as PrismaClient);
+    // The preview loads through one bounded query instead of a nested include.
+    const queryRaw = vi.fn(async () => [
+      { threadId: "thread-1", seq: 4, blocks: [{ kind: "text", text: "Escalation pending" }] },
+    ]);
+    const repos = createGroupRepos({
+      chatGroup: { findMany },
+      $queryRaw: queryRaw,
+    } as unknown as PrismaClient);
     const actor = {
       spaceId: "workspace-1",
       userId: "user-1",
@@ -58,6 +62,7 @@ describe("listSpaceGroupsForSpaces", () => {
     expect(query.select).not.toHaveProperty("userId");
     expect(query.select).not.toHaveProperty("archivedAt");
     expect(query.select).not.toHaveProperty("createdAt");
+    expect(queryRaw).toHaveBeenCalledWith(expect.anything(), ["thread-1"], 1);
   });
 });
 

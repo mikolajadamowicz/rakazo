@@ -355,6 +355,60 @@ describe("finalizeRun", () => {
       data: { runId: "run-reply", claimedAt: null },
     });
   });
+
+  it("does not re-queue a completed continuation's own unclaimed batch", async () => {
+    const tx = {
+      $queryRaw: vi.fn(async () => []),
+      run: {
+        findUnique: vi.fn(async () => ({ status: "running", startedAt: null })),
+        findUniqueOrThrow: vi.fn(async () => ({ sourceMessage: { seq: 7 } })),
+        findFirst: vi.fn(async () => null),
+        updateMany: vi.fn(async () => ({ count: 1 })),
+      },
+      attempt: { updateMany: vi.fn(async () => ({ count: 1 })) },
+      task: { updateMany: vi.fn(async () => ({ count: 1 })) },
+      thread: { update: vi.fn(async () => ({ nextEventSeq: 1 })) },
+      event: {
+        create: vi.fn(async () => ({ threadId: "thread-1", seq: 0 })),
+        deleteMany: vi.fn(async () => ({ count: 0 })),
+      },
+      steeringMessage: {
+        deleteMany: vi.fn(async () => ({ count: 2 })),
+        findMany: vi.fn(async () => []),
+        updateMany: vi.fn(async () => ({ count: 0 })),
+      },
+      bot: { update: vi.fn(async () => ({})) },
+    };
+    const prisma = {
+      $transaction: vi.fn(async (callback: (client: typeof tx) => unknown) => callback(tx)),
+    } as unknown as PrismaClient;
+
+    await expect(
+      finalizeRun(prisma, {
+        spaceId: "space-1",
+        threadId: "thread-1",
+        botId: "bot-1",
+        runId: "follow-up-run",
+        taskId: "follow-up-task",
+        attemptId: "attempt-1",
+        leaseOwner: "worker-1",
+        leaseFence: 1,
+        outcome: "completed",
+        blocks: [],
+      }),
+    ).resolves.toEqual({ continuationRunId: null });
+
+    expect(tx.steeringMessage.deleteMany).toHaveBeenCalledWith({
+      where: {
+        runId: "follow-up-run",
+        OR: [{ claimedAt: { not: null } }, { message: { seq: { lte: 7 } } }],
+      },
+    });
+    expect(tx.steeringMessage.updateMany).toHaveBeenCalledWith({
+      where: { runId: "follow-up-run", message: { seq: { gt: 7 } } },
+      data: { runId: null },
+    });
+  });
 });
 
 describe("followThreadEvents", () => {
@@ -3079,7 +3133,10 @@ describe("appendEvent", () => {
     expect(tx.event.create).toHaveBeenCalledWith({
       data: expect.objectContaining({ type: "run.cancelled", runId: "run-1", seq: 7 }),
     });
-    expect(publish).toHaveBeenCalledWith("thread:thread-1", JSON.stringify({ cursor: 7 }));
+    expect(publish).toHaveBeenCalledWith(
+      "thread:thread-1",
+      JSON.stringify({ cursor: 7, type: "run.cancelled" }),
+    );
   });
 
   it("rejects run.cancelled while the run is not cancelled", async () => {

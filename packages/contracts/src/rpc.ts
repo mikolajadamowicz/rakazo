@@ -196,6 +196,8 @@ export const appContract = {
   },
   spaces: {
     list: oc.output(SpaceNavigationSchema),
+    /** Signals that `list` is worth refetching; heartbeats keep the stream observably alive. */
+    subscribe: oc.output(eventIterator(z.object({ type: z.enum(["changed", "heartbeat"]) }))),
     create: oc.input(z.object({ name: spaceName })).output(SpaceSchema),
     rename: oc
       .input(z.object({ spaceId: Id, name: spaceName }))
@@ -496,6 +498,8 @@ export const appContract = {
   },
   routines: {
     list: oc.input(botId).output(z.array(RoutineSchema)),
+    /** Every routine on the caller's own bots in the space, for mention pickers. */
+    listForSpace: oc.output(z.array(RoutineSchema)),
     history: oc
       .input(z.object({ routineId: Id, before: RoutineRunCursorSchema.optional() }))
       .output(RoutineHistorySchema),

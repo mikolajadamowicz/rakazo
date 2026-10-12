@@ -11,7 +11,12 @@ import type { Prisma, PrismaClient } from "./client.js";
 import { expireComputerExecutionLeases } from "./computers.js";
 import { IsolationError } from "./scope.js";
 import { lockSpaceForContentCreation } from "./spaces.js";
-import { activeRunSelection, activeRunStatuses, previewFromBlocks } from "./thread-listing.js";
+import {
+  activeRunSelection,
+  activeRunStatuses,
+  latestThreadMessages,
+  previewFromBlocks,
+} from "./thread-listing.js";
 
 type GroupRecord = {
   id: string;
@@ -139,6 +144,21 @@ function memberRowsInOrder(groupId: string, botIds: string[], base = Date.now())
 }
 
 const groupMemberOrder = [{ createdAt: "asc" as const }, { botId: "asc" as const }];
+
+function threadIdsOf(groups: ReadonlyArray<{ thread: { id: string } | null }>) {
+  return groups.flatMap((group) => (group.thread ? [group.thread.id] : []));
+}
+
+/** Attach the preview message loaded by `latestThreadMessages` in place of a nested include. */
+function withLatestMessage<T extends { thread: { id: string } | null }>(
+  group: T,
+  latest: Map<string, Array<{ blocks: unknown }>>,
+) {
+  return {
+    ...group,
+    thread: group.thread && { ...group.thread, messages: latest.get(group.thread.id) ?? [] },
+  };
+}
 
 const groupInclude = {
   thread: {
@@ -275,23 +295,15 @@ export function createGroupRepos(prisma: PrismaClient) {
         pinned: true,
         sectionId: true,
         updatedAt: true,
-        thread: {
-          select: {
-            unread: true,
-            messages: {
-              orderBy: { seq: "desc" },
-              take: 1,
-              select: { blocks: true },
-            },
-          },
-        },
+        thread: { select: { id: true, unread: true } },
         members: groupInclude.members,
       },
       orderBy: [{ pinned: "desc" }, { updatedAt: "desc" }],
     });
+    const latest = await latestThreadMessages(prisma, threadIdsOf(groups), 1);
     return groups
       .filter((group) => hasMinimumActiveMembers(group.members))
-      .map((group) => mapSpaceGroup(group));
+      .map((group) => mapSpaceGroup(withLatestMessage(group, latest)));
   }
 
   return {
@@ -302,12 +314,13 @@ export function createGroupRepos(prisma: PrismaClient) {
           userId: actor.userId,
           archivedAt: options.archived ? { not: null } : null,
         },
-        include: groupInclude,
+        include: { ...groupInclude, thread: true },
         orderBy: [{ pinned: "desc" }, { updatedAt: "desc" }],
       });
+      const latest = await latestThreadMessages(prisma, threadIdsOf(groups), 1);
       return groups
         .filter((group) => hasMinimumActiveMembers(group.members))
-        .map((group) => mapGroup(group as GroupRecord));
+        .map((group) => mapGroup(withLatestMessage(group, latest) as GroupRecord));
     },
 
     listSpaceGroupsForSpaces,

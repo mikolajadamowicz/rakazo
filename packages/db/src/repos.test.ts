@@ -34,6 +34,42 @@ const baseBot = {
   computer: null,
 };
 
+type FixtureThread = {
+  id?: string;
+  messages?: Array<Record<string, unknown>>;
+  runs?: Array<{ id: string; status: string }>;
+};
+
+/**
+ * Previews and latest runs load through bounded raw queries; serve them from the nested
+ * fixture rows the bot query returns so fixtures keep describing whole threads.
+ */
+function withThreadRows<T extends { bot: { findMany: (...args: never[]) => Promise<unknown> } }>(
+  prisma: T,
+) {
+  let bots: Array<{ thread?: FixtureThread | null }> = [];
+  const findMany = prisma.bot.findMany;
+  return {
+    ...prisma,
+    bot: {
+      ...prisma.bot,
+      findMany: async (...args: never[]) => {
+        bots = (await findMany(...args)) as typeof bots;
+        return bots;
+      },
+    },
+    $queryRaw: vi.fn(async (strings: TemplateStringsArray, ..._values: unknown[]) => {
+      const fromMessages = strings.join("?").includes("FROM messages");
+      return bots.flatMap(({ thread }, index) => {
+        const threadId = thread?.id ?? `thread-${index}`;
+        if (fromMessages) return (thread?.messages ?? []).map((row) => ({ ...row, threadId }));
+        const run = thread?.runs?.[0];
+        return run ? [{ ...run, threadId }] : [];
+      });
+    }),
+  };
+}
+
 function reposFor(memoryScope: string | null) {
   const prisma = {
     bot: {
@@ -43,7 +79,7 @@ function reposFor(memoryScope: string | null) {
       findMany: vi.fn(async () => []),
     },
   };
-  return createRepos(prisma as unknown as PrismaClient);
+  return createRepos(withThreadRows(prisma) as unknown as PrismaClient);
 }
 
 describe("createRepos.listBots", () => {
@@ -54,7 +90,8 @@ describe("createRepos.listBots", () => {
         thread: { ...baseBot.thread, runs: [{ id: "run-failed", status: "failed" }] },
       },
     ]);
-    const repos = createRepos({ bot: { findMany } } as unknown as PrismaClient);
+    const prisma = withThreadRows({ bot: { findMany } });
+    const repos = createRepos(prisma as unknown as PrismaClient);
 
     const failed = await repos.listBots(actor);
     expect(failed[0]).toMatchObject({ status: "idle", runErrorId: "run-failed" });
@@ -68,21 +105,11 @@ describe("createRepos.listBots", () => {
     const recovered = await repos.listBots(actor);
     expect(recovered[0]).toMatchObject({ status: "idle", runErrorId: null });
 
-    expect(findMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        include: expect.objectContaining({
-          thread: expect.objectContaining({
-            include: expect.objectContaining({
-              runs: expect.objectContaining({
-                where: { trigger: { notIn: ["bot_message", "tickets"] } },
-                orderBy: [{ createdAt: "desc" }, { id: "desc" }],
-                take: 1,
-                select: { id: true, status: true },
-              }),
-            }),
-          }),
-        }),
-      }),
+    // The roster signal ignores bot-to-bot and background runs.
+    expect(prisma.$queryRaw).toHaveBeenCalledWith(
+      expect.anything(),
+      ["thread-1"],
+      ["bot_message", "tickets"],
     );
   });
 
@@ -116,7 +143,9 @@ describe("createRepos.listBots", () => {
       run: { findMany: vi.fn(async () => []) },
     };
 
-    const bots = await createRepos(prisma as unknown as PrismaClient).listBots(actor);
+    const bots = await createRepos(withThreadRows(prisma) as unknown as PrismaClient).listBots(
+      actor,
+    );
 
     expect(bots.map((bot) => bot.preview)).toEqual(["Answer one", "Answer two"]);
     expect(prisma.run.findMany).toHaveBeenCalledExactlyOnceWith({
@@ -160,7 +189,9 @@ describe("createRepos.listBots", () => {
       },
     };
 
-    const bots = await createRepos(prisma as unknown as PrismaClient).listBots(actor);
+    const bots = await createRepos(withThreadRows(prisma) as unknown as PrismaClient).listBots(
+      actor,
+    );
 
     expect(bots[0]?.preview).toBe("Visible answer");
     expect(prisma.run.findMany).toHaveBeenCalledTimes(2);
@@ -210,20 +241,12 @@ describe("createRepos.listBots", () => {
       },
     };
 
-    await expect(createRepos(prisma as unknown as PrismaClient).listBots(actor)).resolves.toEqual([
+    const rows = withThreadRows(prisma);
+    await expect(createRepos(rows as unknown as PrismaClient).listBots(actor)).resolves.toEqual([
       expect.objectContaining({ preview: "Visible answer" }),
     ]);
-    expect(findMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        include: expect.objectContaining({
-          thread: {
-            include: expect.objectContaining({
-              messages: { orderBy: { seq: "desc" }, take: 16 },
-            }),
-          },
-        }),
-      }),
-    );
+    expect(findMany).toHaveBeenCalledOnce();
+    expect(rows.$queryRaw).toHaveBeenCalledWith(expect.anything(), ["thread-1"], 16);
   });
 
   it("skips a peer-run preview tail when the receipt is outside the window", async () => {
@@ -253,9 +276,9 @@ describe("createRepos.listBots", () => {
       },
     };
 
-    await expect(createRepos(prisma as unknown as PrismaClient).listBots(actor)).resolves.toEqual([
-      expect.objectContaining({ preview: "Visible answer" }),
-    ]);
+    await expect(
+      createRepos(withThreadRows(prisma) as unknown as PrismaClient).listBots(actor),
+    ).resolves.toEqual([expect.objectContaining({ preview: "Visible answer" })]);
   });
 
   it("scans older messages when the newest window is only peer output", async () => {
@@ -288,9 +311,9 @@ describe("createRepos.listBots", () => {
       },
     };
 
-    await expect(createRepos(prisma as unknown as PrismaClient).listBots(actor)).resolves.toEqual([
-      expect.objectContaining({ preview: "Older visible answer" }),
-    ]);
+    await expect(
+      createRepos(withThreadRows(prisma) as unknown as PrismaClient).listBots(actor),
+    ).resolves.toEqual([expect.objectContaining({ preview: "Older visible answer" })]);
     expect(messageFindMany).toHaveBeenCalledWith({
       where: { threadId: "thread-1", seq: { lt: 20 } },
       orderBy: { seq: "desc" },
@@ -331,9 +354,9 @@ describe("createRepos.listBots", () => {
       },
     };
 
-    await expect(createRepos(prisma as unknown as PrismaClient).listBots(actor)).resolves.toEqual([
-      expect.objectContaining({ preview: "Fourth-window answer" }),
-    ]);
+    await expect(
+      createRepos(withThreadRows(prisma) as unknown as PrismaClient).listBots(actor),
+    ).resolves.toEqual([expect.objectContaining({ preview: "Fourth-window answer" })]);
     expect(messageFindMany).toHaveBeenCalledTimes(4);
   });
 });
@@ -353,6 +376,7 @@ describe("createRepos.listSpaceBotsForSpaces", () => {
         updatedAt: new Date("2026-08-20T00:00:00.000Z"),
         parentBotId: null,
         thread: {
+          id: "thread-2",
           unread: true,
           messages: [{ blocks: [{ kind: "text", text: "Waiting for a reply" }] }],
           runs: [{ id: "run-failed", status: "failed" }],
@@ -360,7 +384,7 @@ describe("createRepos.listSpaceBotsForSpaces", () => {
         runs: [{ status: "running" }],
       },
     ]);
-    const repos = createRepos({ bot: { findMany } } as unknown as PrismaClient);
+    const repos = createRepos(withThreadRows({ bot: { findMany } }) as unknown as PrismaClient);
 
     await expect(repos.listSpaceBotsForSpaces(actor, ["ws-2"])).resolves.toEqual([
       {

@@ -58,6 +58,8 @@ export interface ThreadEvents {
   pauseRunForTakeover(input: PauseRunForTakeover): Promise<boolean>;
   sendUserMessage(input: SendUserMessageInput): Promise<SendUserMessageResult>;
   follow(threadId: string, cursor: number, signal?: AbortSignal): AsyncGenerator<ProductEvent>;
+  /** Yields once per burst of non-streaming activity on any of these threads. */
+  followChanges(threadIds: readonly string[], signal?: AbortSignal): AsyncGenerator<void>;
 }
 
 export interface ClearThreadInput {
@@ -262,6 +264,7 @@ export function createThreadEvents(
     pauseRunForInput: (input) => pauseRunForInput(prisma, input, realtime),
     pauseRunForTakeover: (input) => pauseRunForTakeover(prisma, input, realtime),
     sendUserMessage: (input) => sendUserMessage(prisma, input, realtime),
+    followChanges: (threadIds, signal) => followThreadChanges(threadIds, realtime, signal),
     follow: (threadId, cursor, signal) =>
       followThreadEvents(prisma, threadId, cursor, realtime, signal, options.catchUpMs),
   };
@@ -1098,7 +1101,7 @@ export async function appendEvent(
     prisma.$transaction((tx: Prisma.TransactionClient) => appendEventInTransaction(tx, input)),
   );
   const productEvent = mapProductEvent(event);
-  await notifyRealtime(realtime, event.threadId, event.seq);
+  await notifyRealtime(realtime, event.threadId, event.seq, event.type);
   return productEvent;
 }
 
@@ -1222,29 +1225,29 @@ async function finalizeRunOnce(
       payload: input.outcome === "completed" ? {} : { error: input.error },
     });
     await tx.event.deleteMany({ where: { runId: input.runId, type: "thread.progress" } });
+    const { sourceMessage } = await tx.run.findUniqueOrThrow({
+      where: { id: input.runId },
+      select: { sourceMessage: { select: { seq: true } } },
+    });
+    // A continuation's source is the newest steering it was created for. Only newer
+    // messages justify another run, even if this one never claimed its own batch;
+    // releasing that batch again would queue continuations for it forever.
+    const newerThanSource = sourceMessage ? { seq: { gt: sourceMessage.seq } } : undefined;
     if (input.outcome === "completed") {
       await tx.steeringMessage.deleteMany({
-        where: { runId: input.runId, claimedAt: { not: null } },
-      });
-      await tx.steeringMessage.updateMany({
-        where: { runId: input.runId },
-        data: { runId: null },
-      });
-    } else {
-      const { sourceMessage } = await tx.run.findUniqueOrThrow({
-        where: { id: input.runId },
-        select: { sourceMessage: { select: { seq: true } } },
-      });
-      // A continuation's source is the newest steering it was created for. Only newer
-      // messages justify another run after failure, even if setup failed before claiming.
-      await tx.steeringMessage.updateMany({
         where: {
           runId: input.runId,
-          message: sourceMessage ? { seq: { gt: sourceMessage.seq } } : undefined,
+          OR: [
+            { claimedAt: { not: null } },
+            ...(sourceMessage ? [{ message: { seq: { lte: sourceMessage.seq } } }] : []),
+          ],
         },
-        data: { runId: null },
       });
     }
+    await tx.steeringMessage.updateMany({
+      where: { runId: input.runId, message: newerThanSource },
+      data: { runId: null },
+    });
     const continuationRunId = await createPendingSteeringRun(tx, input);
     await tx.bot.update({ where: { id: input.botId }, data: { updatedAt: now } });
     return { threadId: lastEvent.threadId, seq: lastEvent.seq, continuationRunId };
@@ -1378,8 +1381,72 @@ async function notifyRealtime(
   realtime: RealtimeFanout | undefined,
   threadId: string,
   cursor: number,
+  type?: string,
 ): Promise<void> {
-  await realtime?.publish(threadTopic(threadId), JSON.stringify({ cursor })).catch(() => undefined);
+  await realtime
+    ?.publish(threadTopic(threadId), JSON.stringify(type ? { cursor, type } : { cursor }))
+    .catch(() => undefined);
+}
+
+/** Without push, change followers fall back to the cadence clients used to poll at. */
+const CHANGE_POLL_MS = 3_000;
+/** One tick per burst: a run start writes several events within a few milliseconds. */
+const CHANGE_COALESCE_MS = 250;
+
+export async function* followThreadChanges(
+  threadIds: readonly string[],
+  realtime?: RealtimeFanout,
+  signal?: AbortSignal,
+  pollMs = CHANGE_POLL_MS,
+): AsyncGenerator<void> {
+  const latch = new ChangeLatch();
+  const onMessage = (payload: string) => {
+    // Streaming text is already on the open thread; elsewhere only its run start/end matters.
+    if (changeType(payload) === "thread.progress") return;
+    latch.notify();
+  };
+  const unsubscribes = realtime
+    ? await Promise.all(
+        threadIds.map((threadId) =>
+          realtime.subscribe(threadTopic(threadId), onMessage).catch(() => async () => {}),
+        ),
+      )
+    : [];
+  try {
+    let observed = latch.generation;
+    while (!signal?.aborted) {
+      await latch.waitForChange(observed, realtime ? Number.POSITIVE_INFINITY : pollMs, signal);
+      if (signal?.aborted) return;
+      if (realtime) await abortableDelay(CHANGE_COALESCE_MS, signal);
+      if (signal?.aborted) return;
+      // Changes that land while the consumer handles this tick wake the next wait at once.
+      observed = latch.generation;
+      yield;
+    }
+  } finally {
+    await Promise.all(unsubscribes.map((unsubscribe) => unsubscribe()));
+  }
+}
+
+function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal?.addEventListener("abort", done, { once: true });
+  });
+}
+
+function changeType(payload: string): string | undefined {
+  try {
+    const parsed = JSON.parse(payload) as { type?: unknown };
+    return typeof parsed.type === "string" ? parsed.type : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export async function eventsAfter(
@@ -1479,7 +1546,7 @@ class ChangeLatch {
         if (this.wake === finish) this.wake = undefined;
         resolve();
       };
-      const timer = setTimeout(finish, timeoutMs);
+      const timer = Number.isFinite(timeoutMs) ? setTimeout(finish, timeoutMs) : undefined;
       this.wake = finish;
       signal?.addEventListener("abort", finish, { once: true });
       if (this.generation !== expected || signal?.aborted) finish();

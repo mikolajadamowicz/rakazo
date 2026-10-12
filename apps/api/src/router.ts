@@ -844,6 +844,53 @@ export function createRouter(deps: RouterDeps) {
       list: authed.spaces.list.handler(async ({ context }) =>
         spaceNavigationDto(deps, context.actor, repos, groupRepos),
       ),
+      subscribe: authed.spaces.subscribe.handler(async function* ({ context }) {
+        const { spaceId, userId } = context.actor;
+        // Threads listed in this space's navigation. A bot or group made later changes the
+        // client's roster, and the client reopens the stream with it.
+        const threads = await deps.prisma.thread.findMany({
+          where: {
+            OR: [
+              { bot: { spaceId, userId, archivedAt: null } },
+              { group: { spaceId, userId, archivedAt: null } },
+            ],
+          },
+          select: { id: true },
+        });
+        const follow = deps.events.followChanges(
+          threads.map((thread) => thread.id),
+          context.signal,
+        );
+        let pending: Promise<IteratorResult<void>> | undefined;
+        let authorizedAt = Date.now();
+        const assertStillAuthorized = async () => {
+          if (!context.stillAuthorized || Date.now() - authorizedAt < SESSION_RECHECK_MS) return;
+          if (!(await context.stillAuthorized())) throw new ORPCError("UNAUTHORIZED");
+          authorizedAt = Date.now();
+        };
+        try {
+          while (!context.signal?.aborted) {
+            pending ??= follow.next();
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            const next = await Promise.race([
+              pending,
+              new Promise<"silent">((resolve) => {
+                timer = setTimeout(() => resolve("silent"), HEARTBEAT_MS);
+              }),
+            ]).finally(() => clearTimeout(timer));
+            await assertStillAuthorized();
+            if (next === "silent") {
+              yield { type: "heartbeat" as const };
+              continue;
+            }
+            pending = undefined;
+            if (next.done) return;
+            yield { type: "changed" as const };
+          }
+        } finally {
+          void follow.return(undefined).catch(() => {});
+        }
+      }),
       create: authed.spaces.create.handler(async ({ context, input }) => {
         let space: { id: string; name: string };
         try {
@@ -1022,6 +1069,16 @@ export function createRouter(deps: RouterDeps) {
     },
     bootstrap: authed.bootstrap.handler(async ({ context, input }) => {
       const actor = context.actor;
+      const activeThread = (botId: string) =>
+        Promise.all([
+          resolveThreadTarget(deps.prisma, actor, { botId }).then((target) =>
+            threadSnapshot(deps, target),
+          ),
+          listRoutinesDto(deps, actor, botId),
+        ]);
+      // The bot in the URL is almost always the one shown, so its thread loads alongside the
+      // roster. resolveThreadTarget still checks access; a miss falls back below.
+      const requested = input.botId ? activeThread(input.botId).catch(() => null) : null;
       const [me, navigation, archivedBots, archivedGroups] = await Promise.all([
         meDto(deps, actor),
         spaceNavigationDto(deps, actor, repos, groupRepos),
@@ -1030,13 +1087,9 @@ export function createRouter(deps: RouterDeps) {
       ]);
       const { bots, groups, botSections } = navigation.current;
       const active = bots.find((bot) => bot.id === input.botId) ?? bots[0];
+      const prefetched = active && active.id === input.botId ? await requested : null;
       const [thread, routines] = active
-        ? await Promise.all([
-            resolveThreadTarget(deps.prisma, actor, { botId: active.id }).then((target) =>
-              threadSnapshot(deps, target),
-            ),
-            listRoutinesDto(deps, actor, active.id),
-          ])
+        ? (prefetched ?? (await activeThread(active.id)))
         : [null, []];
       return {
         me,
@@ -3264,6 +3317,15 @@ export function createRouter(deps: RouterDeps) {
       list: authed.routines.list.handler(async ({ context, input }) => {
         await repos.getBot(context.actor, input.botId);
         return listRoutinesDto(deps, context.actor, input.botId);
+      }),
+      listForSpace: authed.routines.listForSpace.handler(async ({ context }) => {
+        const rows = await deps.prisma.routine.findMany({
+          where: {
+            spaceId: context.actor.spaceId,
+            bot: { userId: context.actor.userId, archivedAt: null },
+          },
+        });
+        return rows.map(mapRoutine);
       }),
       create: authed.routines.create.handler(async ({ context, input }) => {
         if (hasMixedOneShotSchedule(input.crons)) {
@@ -6154,6 +6216,12 @@ async function spaceNavigationDto(
   repos: ReturnType<typeof createRepos>,
   groupRepos: ReturnType<typeof createGroupRepos>,
 ): Promise<SpaceNavigation> {
+  // The current roster only needs the actor; overlap it with the membership lookups below.
+  const currentBotsRequest = repos.listBots(actor);
+  const currentGroupsRequest = groupRepos.listGroups(actor);
+  // Observed so an early IsolationError below cannot leave them as unhandled rejections.
+  void currentBotsRequest.catch(() => undefined);
+  void currentGroupsRequest.catch(() => undefined);
   const currentSpace = await deps.prisma.space.findUnique({
     where: { id: actor.spaceId },
     select: { organizationId: true },
@@ -6180,8 +6248,8 @@ async function spaceNavigationDto(
     contentBots,
     contentGroups,
   ] = await Promise.all([
-    repos.listBots(actor),
-    groupRepos.listGroups(actor),
+    currentBotsRequest,
+    currentGroupsRequest,
     repos.listSpaceBotsForSpaces(actor, inactiveSpaceIds),
     groupRepos.listSpaceGroupsForSpaces(actor, inactiveSpaceIds),
     repos.listBotSectionsForSpaces(actor, spaceIds),

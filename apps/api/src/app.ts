@@ -191,7 +191,7 @@ export async function createApp(
   const created = prismaOverride
     ? { prisma: prismaOverride, pool: undefined }
     : createDb(env.databaseUrl, {
-        poolMax: parsePositiveInteger(process.env.DB_POOL_MAX, 4),
+        poolMax: parsePositiveInteger(process.env.DB_POOL_MAX, 8),
         applicationName: "rakazo-api",
       });
   let { prisma } = created;
