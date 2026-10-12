@@ -56,3 +56,38 @@ Runtime CPU and launch measurements are informational until enough samples exist
 Bundle sizes are deterministic enough for automated regression checks. Keep hardware, platform, and
 build mode fixed. A comparison that intentionally changes Electron or renderer mode measures the
 combined migration result; it cannot attribute the change to either layer in isolation.
+
+# Web latency and request benchmark
+
+The web benchmark loads a production build of the web app in Chromium against the real API, a
+disposable Postgres database, the scripted agent runtime and the fake sandbox. The API adds a fixed
+round trip to every request (`BENCH_RTT_MS`, default 60) and counts requests per procedure, so
+request waterfalls and polling show up as numbers.
+
+Start the API against an empty database, then a production build behind `vite preview`, then the
+driver:
+
+```sh
+DATABASE_URL=postgres://<user>@<host>:<port>/<disposable-db> \
+  pnpm exec tsx packages/testkit/src/cli/web-performance-server.ts
+
+cd apps/web
+pnpm build
+API_PROXY_TARGET=http://127.0.0.1:3120 WEB_PORT=5190 SCREEN_PROXY_SECRET=<any-32-chars> \
+  pnpm exec vite preview --port 5190 --strictPort
+
+BENCH_LABEL=after pnpm exec playwright test -c bench/playwright.config.ts
+```
+
+Reports go to `test-report/web-performance/<label>.json`. `BENCH_PROFILE=1` also saves a CPU profile
+of the last page load. Recreate the database between runs so every label sees the same data.
+
+## What it measures
+
+- **Shell usable**: navigation start until the active thread's newest message and the composer are
+  in the DOM, sampled every frame. Eight warm loads; the median is reported.
+- **Full transcript mounted**: the same, until the oldest loaded message is in the DOM.
+- **Boot requests**: requests made until the shell is usable, and two and a half seconds later.
+- **Idle**: requests, server time and page main-thread time over 45 seconds with nothing happening.
+- **Per run**: requests from pressing Enter until the run has finished and settled.
+- **Typing**: keydown to next frame with the seeded transcript mounted. This is frame-bound.

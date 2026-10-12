@@ -4,6 +4,66 @@ Goal: make the web app (and the Electron shell that hosts it) at least twice as 
 and stop it flooding the API with requests. Mobile shares the backend and most of the same patterns,
 so each step names the mobile counterpart where one exists.
 
+## Status
+
+The first pass is in. Measured with the web benchmark in `docs/performance.md`: 12 bots, a
+50-message thread, a warm production build, and medians over eight loads.
+
+| Metric | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| Shell usable, 60 ms round trip | 397 ms | 190 ms | 2.1× faster |
+| Shell usable, 120 ms round trip | 492 ms | 248 ms | 2.0× faster |
+| Full transcript mounted, 60 ms round trip | 414 ms | 310 ms | 1.3× faster |
+| Requests until the shell settles | 24 | 11 | 2.2× fewer |
+| Requests per minute, idle visible tab | 24 | 4 | 6× fewer |
+| Server time per minute, idle tab | 614 ms | 63 ms | 9.7× less |
+| Page script time per minute, idle tab | 653 ms | 39 ms | 17× less |
+| Requests per finished run | 11 | 8 | 1.4× fewer |
+
+Typing (keydown to next frame) was already bound by the display refresh and did not change. Send to
+reply is bound by the agent run itself.
+
+What changed:
+
+- **Sidebar freshness is pushed, not polled.** A new `spaces.subscribe` stream sends a coalesced
+  tick when any of the user's bot or group threads changes. Streaming text is ignored. `spaces.list`
+  now runs only on those ticks, on focus (at most every 15 s), and as a 60 s safety net. The stream
+  is held only while the tab is visible.
+- **Refetch bursts collapse.** Sends, run events, space ticks and focus share one scheduler. It
+  folds a burst into a single `spaces.list` and never runs two at once. Unchanged roster responses
+  keep their previous state, so the shell no longer re-renders on its own. The post-send thread
+  refresh no longer refetches routines, skills and the screen.
+- **Boot does fewer round trips.**
+  - `index.html` starts `get-session` and `bootstrap` before the bundle loads; the auth and RPC
+    clients adopt those responses.
+  - Capabilities load alongside them.
+  - `bootstrap` loads the URL's thread alongside the roster.
+  - Navigation starts the roster queries alongside the membership lookups.
+  - Mention routines and connectors load on the first `@`, from one `routines.listForSpace` instead
+    of one request per bot.
+- **First paint renders less.**
+  - A thread opens with its newest 16 rows; the rest mount in a transition right after.
+  - Hover menus mount with them on pointer devices.
+  - `Transcript` props are stable, so its `memo` holds.
+- **Sidebar queries are bounded.** Bot and group previews and the latest run load through one
+  `LATERAL … LIMIT` query each. Prisma ran the nested `take` without a limit, so every listing used
+  to read every message and run of every listed thread.
+- **Server per request.** Membership and deployment settings are read in parallel. The API pool
+  defaults to 8 connections instead of 4.
+- **`computer.updates`** skips hidden tabs and polls fast only while an update is queued or running.
+- **Fixed a runaway follow-up loop.** A completed continuation that never claimed its own steering
+  messages released them again, and each release queued another run forever. Now only messages
+  newer than the run's source are released, as on failure.
+
+Still open, in priority order:
+
+- Mobile still polls `spaces/list` and `me` every 5 s. It can use the same `spaces.subscribe`
+  stream.
+- Phase 1.4: thread stream reconnect backoff. Phase 1.7: session cookie cache and CORS `maxAge`.
+- Phase 3: indexes, bounding live events and the message page loop.
+- Phase 4: streaming paint, virtualization, bundle split.
+- Phase 5: rate limit.
+
 ## Where the time goes today
 
 Findings come from reading the code. Phase 0 turns them into measured numbers before anything ships.
