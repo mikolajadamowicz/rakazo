@@ -28,6 +28,41 @@
         if (meta) meta.setAttribute("content", theme === "light" ? "#fafaf8" : "#0b0c0e");
       })();
     </script>
+    <script>
+      // Start the shell's first requests before the bundle downloads; src/lib/rpc.ts and
+      // src/lib/auth.ts adopt them.
+      // Mirrors initialBootstrapTarget in src/lib/bootstrap-target.ts (pinned by a test).
+      (() => {
+        const path = location.pathname;
+        const app = path === "/app" || path.startsWith("/app/");
+        if (!app && !(window.rakazoDesktop && path === "/")) return;
+        const segment = app ? path.split("/")[2] : undefined;
+        let botId;
+        if (segment && segment !== "g" && segment !== "artifacts" && segment !== "board") {
+          try {
+            botId = decodeURIComponent(segment);
+          } catch {}
+        }
+        let spaceId = null;
+        try {
+          spaceId = localStorage.getItem("rakazo:space-id");
+        } catch {}
+        const headers = { "content-type": "application/json" };
+        if (spaceId) headers["x-rakazo-space-id"] = spaceId;
+        const session = fetch("/api/auth/get-session", { credentials: "include" });
+        const response = fetch("/rpc/bootstrap", {
+          method: "POST",
+          headers,
+          credentials: "include",
+          body: JSON.stringify({ json: botId ? { botId } : {} }),
+        });
+        // A failed early request is retried by the app; keep it out of unhandled rejections.
+        session.catch(() => {});
+        response.catch(() => {});
+        window.__rakazoEarlySession = session;
+        window.__rakazoEarlyBootstrap = { botId, spaceId, response };
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

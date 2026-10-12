@@ -1,4 +1,6 @@
 import type { AppBootstrap } from "@rakazo/contracts";
+import { authClient } from "./auth";
+import { fetchAuthCapabilities } from "./auth-capabilities";
 import { initialBootstrapTarget } from "./bootstrap-target";
 import { markOnce } from "./performance";
 import { rpc } from "./rpc";
@@ -28,6 +30,10 @@ if (initialTarget) {
   // Register a rejection handler immediately while preserving rejection for a consumer.
   void promise.catch(() => undefined);
   primedBootstrap = { botId, promise };
+  // The session and subscription gates sit in front of the shell; start their lookups now
+  // instead of after the first render. The session store dedupes its own mount fetch.
+  authClient.$store.atoms.session?.listen(() => undefined);
+  void fetchAuthCapabilities().catch(() => undefined);
 }
 
 /** The speculative first-load bootstrap, left in place for the shell to take. */

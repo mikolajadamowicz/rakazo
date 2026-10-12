@@ -1,12 +1,15 @@
 import { COMPUTER_UPDATE_STAGES, type ComputerUpdate } from "@rakazo/contracts";
 
 /** Shared polling and local presentation state; the server owns operation lifetime. */
-export function createComputerUpdates(client: {
-  list: () => Promise<ComputerUpdate[]>;
-  start: (botId: string, action: "update" | "recover") => Promise<ComputerUpdate>;
-  dismiss: (id: string) => Promise<unknown>;
-  releaseInterrupted: (id: string) => Promise<unknown>;
-}) {
+export function createComputerUpdates(
+  client: {
+    list: () => Promise<ComputerUpdate[]>;
+    start: (botId: string, action: "update" | "recover") => Promise<ComputerUpdate>;
+    dismiss: (id: string) => Promise<unknown>;
+    releaseInterrupted: (id: string) => Promise<unknown>;
+  },
+  options: { isVisible?: () => boolean } = {},
+) {
   let state: { updates: ComputerUpdate[]; openId: string | null } = { updates: [], openId: null };
   const listeners = new Set<() => void>();
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -18,6 +21,8 @@ export function createComputerUpdates(client: {
   const poll = async (epoch: number) => {
     const stamp = revision;
     try {
+      // Nobody is looking; the next visible tick picks the state back up.
+      if (options.isVisible && !options.isVisible()) return;
       const updates = await client.list();
       if (epoch !== generation || stamp !== revision) return;
       if (JSON.stringify(state.updates) === JSON.stringify(updates)) return;
@@ -31,7 +36,11 @@ export function createComputerUpdates(client: {
     } finally {
       if (epoch === generation) {
         clearTimeout(timer);
-        timer = setTimeout(() => void poll(epoch), state.updates.length ? 1500 : 15000);
+        // Finished or failed rows stay listed until dismissed but no longer move.
+        const moving = state.updates.some(
+          (item) => item.status === "queued" || item.status === "running",
+        );
+        timer = setTimeout(() => void poll(epoch), moving ? 1500 : 15000);
       }
     }
   };

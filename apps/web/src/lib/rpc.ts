@@ -51,6 +51,28 @@ export function withSpaceHeaders(
   return headers;
 }
 
+type EarlyBootstrap = { botId?: string; spaceId: string | null; response: Promise<Response> };
+
+declare global {
+  interface Window {
+    __rakazoEarlyBootstrap?: EarlyBootstrap;
+  }
+}
+
+/** The bootstrap index.html started before the bundle loaded, if it asked for this request. */
+async function adoptEarlyBootstrap(request: Request, spaceId: string | null) {
+  const early = typeof window === "undefined" ? undefined : window.__rakazoEarlyBootstrap;
+  if (!early || new URL(request.url).pathname !== "/rpc/bootstrap") return null;
+  window.__rakazoEarlyBootstrap = undefined;
+  if (early.spaceId !== spaceId) return null;
+  const body = (await request
+    .clone()
+    .json()
+    .catch(() => null)) as { json?: { botId?: string } } | null;
+  if (body?.json?.botId !== early.botId) return null;
+  return early.response.catch(() => null);
+}
+
 const link = new RPCLink<RpcClientContext>({
   url: () =>
     typeof window === "undefined"
@@ -69,6 +91,8 @@ const link = new RPCLink<RpcClientContext>({
     }
     const spaceId =
       options.context.spaceId === undefined ? selectedSpaceId() : options.context.spaceId;
+    const early = await adoptEarlyBootstrap(request, spaceId);
+    if (early) return early;
     return fetch(request, {
       headers: withSpaceHeaders(request.headers, spaceId),
       credentials: "include",

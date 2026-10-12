@@ -124,6 +124,7 @@ import {
   Fragment,
   memo,
   Suspense,
+  startTransition,
   useCallback,
   useEffect,
   useId,
@@ -325,6 +326,12 @@ const ATTACHMENT_ACCEPT = [...ATTACHMENT_ALLOWED_MIME_TYPES, ".zip"].join(",");
 /** Identity colour for bots the roster no longer knows about. */
 const FALLBACK_BOT_COLOR = "#85858A";
 const THREAD_SNAPSHOT_TIMEOUT_MS = 2_000;
+const BOTS_REFRESH_COALESCE_MS = 150;
+const FOCUS_BOTS_REFRESH_MS = 15_000;
+const SAFETY_BOTS_REFRESH_MS = 60_000;
+const SPACE_STREAM_RETRY_MS = 1_000;
+/** Rows a thread opens with; older rows mount right after the first paint. */
+const INITIAL_TRANSCRIPT_ROWS = 16;
 /** Bound Settings leave so a hung voice status refresh cannot block dismissal. */
 const VOICE_STATUS_REFRESH_TIMEOUT_MS = 10_000;
 const MOBILE_SIDEBAR_SWIPE_EDGE_PX = 32;
@@ -963,11 +970,11 @@ export function ShellPage() {
           botOrderEpoch === botOrderEpochRef.current &&
           (replaceBotOrder || (!preserveBotOrder && !savingBotOrderRef.current))
         ) {
-          setBots(list);
+          setBots(keepIfEqual(list));
         }
-        setBotSections(sections);
-        setGroups(groupList);
-        setSpaces(navigation.spaces);
+        setBotSections(keepIfEqual(sections));
+        setGroups(keepIfEqual(groupList));
+        setSpaces(keepIfEqual(navigation.spaces));
         setInitialBotsLoaded(true);
         botsRefreshApplied.current = request;
         if (
@@ -1001,6 +1008,32 @@ export function ShellPage() {
     },
     [navigate],
   );
+  // Sends, run events, space pushes and focus all want a fresh roster. Fold each burst
+  // into one spaces.list, and while one is in flight queue at most one more.
+  const botsRefreshSchedule = useRef<{ timer?: number; running: boolean; queued: boolean }>({
+    running: false,
+    queued: false,
+  });
+  const scheduleBotsRefresh = useCallback(() => {
+    const schedule = botsRefreshSchedule.current;
+    if (schedule.running) {
+      schedule.queued = true;
+      return;
+    }
+    if (schedule.timer !== undefined) return;
+    schedule.timer = window.setTimeout(() => {
+      schedule.timer = undefined;
+      schedule.running = true;
+      void refreshBots()
+        .catch(() => undefined)
+        .finally(() => {
+          schedule.running = false;
+          if (!schedule.queued) return;
+          schedule.queued = false;
+          scheduleBotsRefresh();
+        });
+    }, BOTS_REFRESH_COALESCE_MS);
+  }, [refreshBots]);
 
   function snapTranscriptToEndAfterFrame() {
     const queuedElement = messageScroll.current;
@@ -1043,7 +1076,7 @@ export function ShellPage() {
     return snap;
   }
 
-  async function refreshThread(id: string, signal?: AbortSignal) {
+  async function refreshThread(id: string, signal?: AbortSignal, sideData = true) {
     const scrollElement = messageScroll.current;
     const stickToEnd = !scrollElement || transcriptIsNearEnd(scrollElement);
     markOnce("rk:renderer:thread-request-start");
@@ -1076,6 +1109,7 @@ export function ShellPage() {
     ) {
       snapTranscriptToEndAfterFrame();
     }
+    if (!sideData) return snap;
     void Promise.all([
       rpc.routines.list({ botId: id }).catch(() => null),
       rpc.skills.list({ botId: id }).catch(() => null),
@@ -1229,28 +1263,65 @@ export function ShellPage() {
         setBootstrapMe(null);
         void refreshBots(true);
       });
-    let refreshTimer: number | undefined;
+    // The space stream keeps the roster live. Focus and the slow poll only cover a stream
+    // that dropped quietly, so they stay rare.
+    let lastFocusRefresh = Date.now();
     const refreshVisibleBots = () => {
       if (document.visibilityState !== "visible") return;
-      window.clearTimeout(refreshTimer);
-      refreshTimer = window.setTimeout(() => void refreshBots().catch(() => undefined), 50);
+      if (Date.now() - lastFocusRefresh < FOCUS_BOTS_REFRESH_MS) return;
+      lastFocusRefresh = Date.now();
+      scheduleBotsRefresh();
     };
     window.addEventListener("focus", refreshVisibleBots);
     document.addEventListener("visibilitychange", refreshVisibleBots);
-    // Poll skips while a refresh is in flight; focus/visibility and event-driven
-    // callers still bump botsRefreshEpoch so only the latest response applies.
     const poll = window.setInterval(() => {
-      if (botsRefreshInFlight.current > 0) return;
-      refreshVisibleBots();
-    }, 3_000);
+      if (document.visibilityState === "visible") scheduleBotsRefresh();
+    }, SAFETY_BOTS_REFRESH_MS);
     return () => {
       cancelled = true;
-      window.clearTimeout(refreshTimer);
       window.clearInterval(poll);
       window.removeEventListener("focus", refreshVisibleBots);
       document.removeEventListener("visibilitychange", refreshVisibleBots);
     };
   }, []);
+
+  const rosterKey = useMemo(
+    () => [...bots.map((bot) => bot.id), ...groups.map((group) => group.id)].sort().join(","),
+    [bots, groups],
+  );
+  // Only a visible tab holds the space stream: on HTTP/1.1 every open stream takes one of the
+  // browser's few connections to the server, and a hidden tab catches up when it returns.
+  const pageVisible = useSyncExternalStore(
+    subscribePageVisibility,
+    () => document.visibilityState === "visible",
+    () => true,
+  );
+  const spaceStreamOpened = useRef(false);
+  useEffect(() => {
+    if (!initialBotsLoaded || !pageVisible) return;
+    const abort = new AbortController();
+    if (spaceStreamOpened.current) scheduleBotsRefresh();
+    spaceStreamOpened.current = true;
+    void (async () => {
+      let retryMs = SPACE_STREAM_RETRY_MS;
+      while (!abort.signal.aborted) {
+        try {
+          const changes = await rpc.spaces.subscribe(undefined, { signal: abort.signal });
+          for await (const change of changes) {
+            retryMs = SPACE_STREAM_RETRY_MS;
+            if (change.type === "changed") scheduleBotsRefresh();
+          }
+        } catch {
+          // Reconnect below; the roster catches up once the stream is back.
+        }
+        if (abort.signal.aborted) return;
+        await new Promise((resolve) => window.setTimeout(resolve, retryMs));
+        retryMs = Math.min(retryMs * 2, 30_000);
+        if (!abort.signal.aborted) scheduleBotsRefresh();
+      }
+    })();
+    return () => abort.abort();
+  }, [initialBotsLoaded, pageVisible, rosterKey, scheduleBotsRefresh]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1406,12 +1477,12 @@ export function ShellPage() {
           isRunTerminalEvent(event) ||
           event.type === "thread.cleared"
         ) {
-          void refreshBots().catch(() => undefined);
+          scheduleBotsRefresh();
         }
         if (event.type === "thread.message.created") {
           const blocks = (event.payload.blocks as Array<{ kind?: string }>) ?? [];
           if (blocks.some((block) => block.kind === "child_bot")) {
-            void refreshBots().catch(() => undefined);
+            scheduleBotsRefresh();
           }
           if (event.payload.role === "bot") markBotReadIfVisible(active.id);
         }
@@ -1510,7 +1581,7 @@ export function ShellPage() {
           event.type === "bot.updated" ||
           isRunTerminalEvent(event)
         ) {
-          void refreshBots().catch(() => undefined);
+          scheduleBotsRefresh();
         }
         if (isRunTerminalEvent(event) || event.type === "run.waiting_input") {
           // waiting_input: reconcile ask cards if a stale post-send refresh raced SSE.
@@ -1793,10 +1864,11 @@ export function ShellPage() {
     setReplyTarget(null);
     setReplyQuote(null);
   }, []);
-  const currentRuns = activeThreadRuns(activeSnapshot);
+  const currentRuns = useMemo(() => activeThreadRuns(activeSnapshot), [activeSnapshot]);
   const answerableAskMessageId = latestAnswerableAskMessageId(activeSnapshot);
-  const workingRuns = currentRuns.filter((run) =>
-    ["running", "queued", "leased"].includes(run.status),
+  const workingRuns = useMemo(
+    () => currentRuns.filter((run) => ["running", "queued", "leased"].includes(run.status)),
+    [currentRuns],
   );
   const transcriptRunning = workingRuns.length > 0;
   const composerRunning = currentRuns.some((run) => isActive(run.status));
@@ -1823,15 +1895,19 @@ export function ShellPage() {
     },
     [bots, transcriptMembers],
   );
-  const workingBots: GroupAvatarMember[] = workingRuns.map((run) => {
-    const bot = resolveTranscriptBot(run.botId);
-    return {
-      botId: run.botId,
-      color: bot?.color ?? FALLBACK_BOT_COLOR,
-      name: bot?.name,
-      status: run.status,
-    };
-  });
+  const workingBots = useMemo<GroupAvatarMember[]>(
+    () =>
+      workingRuns.map((run) => {
+        const bot = resolveTranscriptBot(run.botId);
+        return {
+          botId: run.botId,
+          color: bot?.color ?? FALLBACK_BOT_COLOR,
+          name: bot?.name,
+          status: run.status,
+        };
+      }),
+    [workingRuns, resolveTranscriptBot],
+  );
   const resolveTranscriptMemberName = useCallback(
     (botId: string | undefined) => memberName(transcriptMembers, botId),
     [transcriptMembers],
@@ -1881,30 +1957,30 @@ export function ShellPage() {
   const botsForMentionsRef = useRef(bots);
   botsForMentionsRef.current = bots;
 
+  // Routines and connectors only feed the @ menu, so they load the first time it opens.
+  const [mentionDataRequested, setMentionDataRequested] = useState(false);
+  const requestMentionData = useCallback(() => setMentionDataRequested(true), []);
   useEffect(() => {
     const bots = botsForMentionsRef.current;
-    if (!initialBotsLoaded || bots.length === 0) {
+    if (!mentionDataRequested || !initialBotsLoaded || bots.length === 0) {
       setMentionRoutines([]);
       setMentionConnectors([]);
       return;
     }
     let cancelled = false;
     const botNameById = new Map(bots.map((bot) => [bot.id, bot.name]));
-    void Promise.all(
-      bots.map((bot) =>
-        rpc.routines
-          .list({ botId: bot.id })
-          .then((rows) =>
-            rows.map((routine) => ({
-              ...routine,
-              botName: botNameById.get(bot.id) ?? bot.name,
-            })),
-          )
-          .catch(() => [] as Array<Routine & { botName?: string }>),
-      ),
-    ).then((lists) => {
-      if (!cancelled) setMentionRoutines(lists.flat());
-    });
+    void rpc.routines
+      .listForSpace()
+      .catch(() => [] as Routine[])
+      .then((rows) => {
+        if (cancelled) return;
+        setMentionRoutines(
+          rows.flatMap((routine) => {
+            const botName = botNameById.get(routine.botId);
+            return botName === undefined ? [] : [{ ...routine, botName }];
+          }),
+        );
+      });
     void Promise.all([
       rpc.connections.list().catch(() => [] as Connection[]),
       rpc.connections.catalog({}).catch(() => [] as ConnectionCatalogItem[]),
@@ -1944,7 +2020,7 @@ export function ShellPage() {
     return () => {
       cancelled = true;
     };
-  }, [initialBotsLoaded, mentionBotsKey]);
+  }, [initialBotsLoaded, mentionBotsKey, mentionDataRequested]);
 
   useLayoutEffect(() => {
     if (initialBotsLoaded) {
@@ -1981,6 +2057,14 @@ export function ShellPage() {
   }, [active, groupId, inGroup, snapshot?.botId, snapshot?.groupId, snapshot?.threadId]);
 
   const openBot = useCallback((id: string) => navigate(`/app/${id}`), [navigate]);
+  const replyToMessage = useCallback((message: ThreadMessage) => {
+    setReplyTarget(message);
+    setReplyQuote(null);
+  }, []);
+  const quoteMessage = useCallback((message: ThreadMessage, quote: string) => {
+    setReplyTarget(message);
+    setReplyQuote(quote);
+  }, []);
   const loadOlder = useCallback(() => loadOlderMessagesRef.current(), []);
   const jumpToReplyMessage = useCallback((messageId: string) => {
     const existing = document.querySelector(`[data-message-id="${CSS.escape(messageId)}"]`);
@@ -2206,7 +2290,7 @@ export function ShellPage() {
           current.filter((attachment) => attachment.threadKey !== originThreadKey),
         );
         // Refresh sidebar status even when a bot→group reroute navigates away below.
-        void refreshBots().catch(() => undefined);
+        scheduleBotsRefresh();
         if (reroutedToGroup && groupTarget) {
           navigate(`/app/g/${groupTarget}`);
           return true;
@@ -2214,7 +2298,9 @@ export function ShellPage() {
         if (groupTarget && activeGroupId.current === groupTarget) setAttachmentNotice(null);
         if (botTarget && activeBotId.current === botTarget) setAttachmentNotice(null);
         if (groupTarget) void refreshGroupThreadRef.current(groupTarget).catch(() => undefined);
-        else if (botTarget) void refreshThreadRef.current(botTarget).catch(() => undefined);
+        // The run's own events bring routines, skills and the screen up to date when it ends.
+        else if (botTarget)
+          void refreshThreadRef.current(botTarget, undefined, false).catch(() => undefined);
         return true;
       } catch (error) {
         if (reroutedToGroup && groupTarget) {
@@ -3671,19 +3757,11 @@ export function ShellPage() {
             onLoadOlder={loadOlder}
             onOpenBot={openBot}
             onAnswer={answerMessage}
-            onReply={(message) => {
-              setReplyTarget(message);
-              setReplyQuote(null);
-            }}
-            onQuote={(message, quote) => {
-              setReplyTarget(message);
-              setReplyQuote(quote);
-            }}
+            onReply={replyToMessage}
+            onQuote={quoteMessage}
             onReact={reactToMessage}
             onJumpToMessage={jumpToReplyMessage}
-            onOpenPeerMessages={(peer) => {
-              setPeerConversation(peer);
-            }}
+            onOpenPeerMessages={setPeerConversation}
             memberName={resolveTranscriptMemberName}
             peerBot={resolveTranscriptBot}
             onRefresh={refreshActiveThread}
@@ -3743,6 +3821,7 @@ export function ShellPage() {
             mentionTargets={composerMentionTargets}
             agentSkills={agentSkills}
             onSlashOpen={refreshAgentSkills}
+            onMentionOpen={requestMentionData}
             onSlashAction={(action) => {
               if (action === "chat-settings") {
                 setPanel(inGroup ? "group-settings" : "settings");
@@ -4809,6 +4888,17 @@ export function ShellPage() {
   );
 }
 
+function subscribePageVisibility(onChange: () => void) {
+  document.addEventListener("visibilitychange", onChange);
+  return () => document.removeEventListener("visibilitychange", onChange);
+}
+
+/** State updater that keeps the current value when a refetch returned the same data. */
+function keepIfEqual<T>(next: T) {
+  const serialized = JSON.stringify(next);
+  return (current: T) => (JSON.stringify(current) === serialized ? current : next);
+}
+
 const Transcript = memo(function Transcript({
   scrollRef,
   scrollRequest,
@@ -5049,9 +5139,27 @@ const Transcript = memo(function Transcript({
     onScrollRequestHandled();
   }, [messages, scrollRequest, scrollRef, endJumpScroll, onScrollRequestHandled]);
 
+  // Opening a long thread pays for its last screenful first: markdown and layout for the
+  // rows above the fold run in a transition after that paint.
+  const [renderAllRows, setRenderAllRows] = useState(false);
+  useEffect(() => {
+    startTransition(() => setRenderAllRows(true));
+  }, []);
+  const allRowsMounted = renderAllRows || scrollRequest != null;
+  // With a fine pointer the hover rail is hidden and out of flow until a row is hovered, so its
+  // menus mount with the older rows. Touch shows the rail in flow and keeps it in the first paint.
+  const [hoverRailDeferred] = useState(
+    () => window.matchMedia?.("(hover: hover) and (pointer: fine)").matches ?? false,
+  );
+  const hoverActionsMounted = allRowsMounted || !hoverRailDeferred;
+  const rows = useMemo(() => {
+    const grouped = groupVoiceChats(reactionView.visibleMessages);
+    return allRowsMounted ? grouped : grouped.slice(-INITIAL_TRANSCRIPT_ROWS);
+  }, [reactionView.visibleMessages, allRowsMounted]);
+
   useLayoutEffect(() => {
     if (following.current) snapToEnd();
-  }, [messages, running, snapToEnd]);
+  }, [messages, rows, running, snapToEnd]);
 
   useLayoutEffect(() => {
     const button = jumpButtonRef.current;
@@ -5130,7 +5238,7 @@ const Transcript = memo(function Transcript({
         }}
         className="rk-scroll flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-4 py-5 md:px-7 md:py-6"
       >
-        {olderCursor != null ? (
+        {olderCursor != null && allRowsMounted ? (
           <button
             type="button"
             disabled={loadingOlder}
@@ -5140,7 +5248,7 @@ const Transcript = memo(function Transcript({
             {loadingOlder ? t`Loading…` : t`Load earlier messages`}
           </button>
         ) : null}
-        {groupVoiceChats(reactionView.visibleMessages).map((item) => {
+        {rows.map((item) => {
           if (item.kind === "voiceChat") {
             return (
               <div key={item.key}>
@@ -5217,7 +5325,7 @@ const Transcript = memo(function Transcript({
                       onOpenComputer={onOpenComputer}
                       showToolActivity={showToolActivity}
                     />
-                    {peerReceipt ? null : (
+                    {peerReceipt || !hoverActionsMounted ? null : (
                       <MessageHoverActions
                         message={message}
                         side={message.role === "user" ? "start" : "end"}
@@ -5412,6 +5520,7 @@ export const Composer = memo(function Composer({
   mentionTargets,
   agentSkills,
   onSlashOpen,
+  onMentionOpen,
   onSlashAction,
 }: {
   activeName?: string;
@@ -5439,6 +5548,7 @@ export const Composer = memo(function Composer({
   mentionTargets?: ComposerMention[];
   agentSkills?: AgentSkillCatalogEntry[];
   onSlashOpen?: () => void;
+  onMentionOpen?: () => void;
   onSlashAction?: (action: SlashActionId) => void;
 }) {
   const { t } = useLingui();
@@ -5585,6 +5695,7 @@ export const Composer = memo(function Composer({
     markEdited();
     setDraft(value);
     const mentionMatch = /(?:^|\s)@([\w-]*)$/.exec(value);
+    if (mentionMatch && mentionQuery === null) onMentionOpen?.();
     setMentionQuery(mentionMatch ? (mentionMatch[1] ?? "") : null);
     // `/` only at the start of the draft so forced skills expand (`Use skill:` / `/Name` prefix).
     const slashMatch = selectedSkill === null ? /^\/([^\n]*)$/.exec(value) : null;
