@@ -1,5 +1,6 @@
 import { createORPCClient } from "@orpc/client";
 import { RPCLink } from "@orpc/client/fetch";
+import { DedupeRequestsPlugin } from "@orpc/client/plugins";
 import type { ContractRouterClient } from "@orpc/contract";
 import type { AppContract } from "@rakazo/contracts";
 import { LOCAL_SETTINGS_PAGE, LOCAL_SETTINGS_RPC } from "@rakazo/contracts";
@@ -51,7 +52,17 @@ export function withSpaceHeaders(
   return headers;
 }
 
+const DEDUPED_READS = new Set(["list", "get", "head", "me"]);
+
 const link = new RPCLink<RpcClientContext>({
+  // Screens mounting together often ask for the same read in one tick; share one request.
+  plugins: [
+    new DedupeRequestsPlugin({
+      filter: ({ path, context }) =>
+        context.spaceId === undefined && DEDUPED_READS.has(path[path.length - 1] ?? ""),
+      groups: [{ condition: () => true, context: {} }],
+    }),
+  ],
   url: () =>
     typeof window === "undefined"
       ? "http://127.0.0.1:5173/rpc"
