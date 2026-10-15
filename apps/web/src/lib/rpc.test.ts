@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { clearSpaceSelection, selectedSpaceId, selectSpace } from "./rpc.js";
+import { clearSpaceSelection, rpc, selectedSpaceId, selectSpace } from "./rpc.js";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -47,5 +47,38 @@ describe("space selection storage", () => {
 
     expect(selectSpace("space-support")).toBe(true);
     expect(setItem).toHaveBeenCalledWith("rakazo:space-id", "space-support");
+  });
+});
+
+describe("request dedupe", () => {
+  function stubBrowser() {
+    const fetch = vi.fn(async () => Response.json({ json: [] }));
+    vi.stubGlobal("window", {
+      location: { origin: "http://rakazo.test", pathname: "/" },
+      localStorage: { getItem: () => null },
+    });
+    vi.stubGlobal("fetch", fetch);
+    return fetch;
+  }
+
+  it("shares one request between identical reads issued together", async () => {
+    const fetch = stubBrowser();
+
+    await Promise.all([rpc.bots.list(), rpc.bots.list(), rpc.bots.list()]);
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps writes and explicit-space reads as separate requests", async () => {
+    const fetch = stubBrowser();
+
+    await Promise.allSettled([
+      rpc.threads.markRead({ botId: "bot-a" }),
+      rpc.threads.markRead({ botId: "bot-a" }),
+      rpc.bots.list(undefined, { context: { spaceId: "space-a" } }),
+      rpc.bots.list(undefined, { context: { spaceId: "space-b" } }),
+    ]);
+
+    expect(fetch).toHaveBeenCalledTimes(4);
   });
 });
