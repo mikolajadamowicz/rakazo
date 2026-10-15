@@ -433,6 +433,18 @@ export default defineConfig(({ mode }) => {
           attachDesktopStackProbe(server, desktopStackToken, imageTag),
       },
       {
+        // Chrome re-requests the tab icon on every in-app navigation; let it come from cache.
+        name: "rakazo-favicon-cache",
+        configurePreviewServer(server) {
+          server.middlewares.use((req, res, next) => {
+            if (req.url?.startsWith("/favicon")) {
+              res.setHeader("cache-control", "public, max-age=86400");
+            }
+            next();
+          });
+        },
+      },
+      {
         name: "rakazo-performance-asset-delay",
         configurePreviewServer(server) {
           if (!Number.isFinite(performanceAssetDelayMs) || performanceAssetDelayMs <= 0) return;
